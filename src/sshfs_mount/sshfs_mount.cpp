@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017-2019 Canonical, Ltd.
+ * Copyright (C) 2017-2020 Canonical, Ltd.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@
 
 #include <multipass/format.h>
 
+#include <QDir>
 #include <iostream>
 
 namespace mp = multipass;
@@ -59,21 +60,41 @@ void check_sshfs_exists(mp::SSHSession& session)
     run_cmd(session, "which sshfs", error_handler);
 }
 
-void make_target_dir(mp::SSHSession& session, const std::string& target)
+// Split a path into existing and to-be-created parts. The input is assumed to
+// be an absolute path, normalized with mp::utils::normalize_absolute_path().
+std::pair<std::string, std::string> get_path_split(mp::SSHSession& session, const std::string& target)
 {
-    run_cmd(session, fmt::format("sudo mkdir -p \"{}\"", target));
+    QString existing =
+        QString::fromStdString(
+            run_cmd(session,
+                    fmt::format("sudo /bin/bash -c 'P=\"{}\"; while [ ! -d \"$P/\" ]; do P=${{P%/*}}; done; echo $P/'",
+                                target)))
+            .trimmed();
+
+    return {existing.toStdString(), QDir(existing).relativeFilePath(QString::fromStdString(target)).toStdString()};
 }
 
-void set_owner_for(mp::SSHSession& session, const std::string& target)
+// Create a directory on a given root folder.
+void make_target_dir(mp::SSHSession& session, const std::string& root, const std::string& relative_target)
+{
+    if (!relative_target.empty())
+        run_cmd(session, fmt::format("sudo /bin/bash -c 'cd \"{}\" && mkdir -p \"{}\"'", root, relative_target));
+}
+
+// Set ownership of all directories on a path starting on a given root.
+// Assume it is already created.
+void set_owner_for(mp::SSHSession& session, const std::string& root, const std::string& relative_target)
 {
     auto vm_user = run_cmd(session, "id -nu");
     auto vm_group = run_cmd(session, "id -ng");
     mp::utils::trim_end(vm_user);
     mp::utils::trim_end(vm_group);
 
-    run_cmd(session, fmt::format("sudo chown {}:{} \"{}\"", vm_user, vm_group, target));
+    run_cmd(session, fmt::format("sudo /bin/bash -c 'cd \"{}\" && chown -R {}:{} {}'", root, vm_user, vm_group,
+                                 relative_target.substr(0, relative_target.find_first_of('/'))));
 }
 
+// The target is assumed to be an absolute path, normalized via mp::utils::normalize_absolute_path().
 auto make_sftp_server(mp::SSHSession&& session, const std::string& source, const std::string& target,
                       const std::unordered_map<int, int>& gid_map, const std::unordered_map<int, int>& uid_map)
 {
@@ -81,8 +102,14 @@ auto make_sftp_server(mp::SSHSession&& session, const std::string& source, const
              fmt::format("{}:{} {}(source = {}, target = {}, …): ", __FILE__, __LINE__, __FUNCTION__, source, target));
 
     check_sshfs_exists(session);
-    make_target_dir(session, target);
-    set_owner_for(session, target);
+
+    // Split the path in existing and missing parts.
+    const auto& [leading, missing] = get_path_split(session, target);
+
+    // We need to create the part of the path which does not still exist,
+    // and set then the correct ownership.
+    make_target_dir(session, leading, missing);
+    set_owner_for(session, leading, missing);
 
     auto output = run_cmd(session, "id -u");
     mpl::log(mpl::Level::debug, category,
